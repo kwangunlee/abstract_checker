@@ -159,9 +159,7 @@ if page.startswith("1"):
         src = st.text_area(
             "정제할 초록",
             height=200,
-            value=st.session_state.abstract_for_classify,
             placeholder="여기에 초록을 붙여넣기…",
-            key="clean_input",
         )
 
         if src:
@@ -190,7 +188,7 @@ if page.startswith("1"):
             cleaned, changes, unmapped = clean_text(src)
 
             st.subheader("✅ 정제 결과")
-            st.text_area("정제된 초록", cleaned, height=200, key="clean_output")
+            st.text_area("정제된 초록", cleaned, height=200)
 
             # 미매핑 경고
             if unmapped:
