@@ -1,324 +1,203 @@
 """
-CP949 인코딩 정제기 (CP949 Encoding Cleaner)
-──────────────────────────────────────────────
-웹에서 복사한 텍스트를 CP949(EUC-KR) 환경에 저장할 때
-전각 물음표(？)로 깨지는 문자를 미리 찾아 안전한 문자로 치환한다.
+연구자료 초록 처리 통합 도구
+────────────────────────────────
+하나의 앱에서 흐름이 이어진다:
+  1) CP949 인코딩 정제 (？ 깨짐 방지·복구)
+  2) 초록 다듬기 & 주제분류 (GPT, 4단계 규칙)
+
+정제한 초록이 그대로 다듬기·분류로 넘어가도록 세션에 공유한다.
 """
 
 import io
+import json
 import unicodedata
 
 import pandas as pd
 import streamlit as st
 
-TARGET_ENCODING = "cp949"  # = ks_c_5601-1987 / EUC-KR 계열
-
-# 명시적 치환맵 — accent-stripping으로 처리하면 안 되는(의미가 다른) 문자
-EXPLICIT_MAP = {
-    # ── 공백류 → 스페이스 또는 제거 ──
-    "\u00A0": " ", "\u202F": " ", "\u2009": " ", "\u2007": " ",
-    "\u2002": " ", "\u2003": " ", "\u2008": " ", "\u200A": " ",
-    "\u200B": "", "\u200C": "", "\u200D": "", "\u00AD": "", "\uFEFF": "",
-    # ── 하이픈·대시·마이너스류 → - ──
-    # 주의: CP949에는 하이픈과 마이너스를 구분하는 문자가 없어서
-    #       ASCII 하이픈-마이너스 '-'(U+002D) 하나로 모두 합침.
-    "\u2010": "-",   # hyphen
-    "\u2011": "-",   # non-breaking hyphen
-    "\u2012": "-",   # figure dash
-    "\u2013": "-",   # en dash –
-    "\u2014": "-",   # em dash —
-    "\u2015": "-",   # horizontal bar
-    "\u2212": "-",   # minus sign −  (수학 마이너스)
-    "\u2E3A": "-",   # two-em dash
-    "\u2E3B": "-",   # three-em dash
-    "\uFF0D": "-",   # fullwidth hyphen-minus －
-    "\uFE63": "-",   # small hyphen-minus ﹣
-    "\uFE58": "-",   # small em dash ﹘
-    "\u2043": "-",   # hyphen bullet ⁃
-    # ── 따옴표·구두점류 ──
-    "\u2018": "'", "\u2019": "'", "\u201A": "'", "\u201B": "'",
-    "\u201C": '"', "\u201D": '"', "\u201E": '"',
-    "\u2032": "'", "\u2033": '"', "\u2026": "...",
-    "\u2039": "<", "\u203A": ">", "\u00AB": "<<", "\u00BB": ">>",
-    # ── 불릿류 → - ──
-    "\u2022": "-",   # • bullet
-    "\u2023": "-",   # ‣ triangular bullet
-    # ── 가운뎃점(중점)류 → . ── (전각/반각/변종 모두)
-    "\u00B7": ".",   # · middle dot (라틴)
-    "\u0387": ".",   # · greek ano teleia
-    "\u2027": ".",   # ‧ hyphenation point
-    "\u2219": ".",   # ∙ bullet operator
-    "\u22C5": ".",   # ⋅ dot operator
-    "\u2E31": ".",   # word separator middle dot
-    "\u30FB": ".",   # ・ 전각 가운뎃점 (CJK katakana middle dot)
-    "\uFF65": ".",   # ･ 반각 가운뎃점 (halfwidth katakana middle dot)
-    # ── 기타 자주 나오는 기호 ──
-    "\u00D7": "x", "\u00F7": "/", "\u2044": "/",
-    "\u2122": "(TM)", "\u00A9": "(C)", "\u00AE": "(R)",
-    "\u2192": "->", "\u2190": "<-",
-}
-
-# 독일어 움라우트: 이름 보존용 확장 표기 (항상 적용)
-GERMAN_EXPANSION = {
-    "\u00FC": "ue", "\u00F6": "oe", "\u00E4": "ae", "\u00DF": "ss",
-    "\u00DC": "Ue", "\u00D6": "Oe", "\u00C4": "Ae",
-}
-
-CONTEXT_WINDOW = 20  # 문맥 표시 시 앞뒤로 보여줄 글자 수
-
-
-def find_breaking_chars(text: str):
-    """CP949로 인코딩 불가능한 문자를 (위치, 문자, 코드포인트)로 반환."""
-    broken = []
-    for i, ch in enumerate(text):
-        try:
-            ch.encode(TARGET_ENCODING)
-        except UnicodeEncodeError:
-            broken.append((i, ch, ord(ch)))
-    return broken
-
-
-def _visible(s: str) -> str:
-    """문맥 안의 안 보이는 공백류를 눈에 보이게 치환."""
-    return (
-        s.replace("\u00A0", "·").replace("\u202F", "·")
-        .replace("\u2009", "·").replace("\u200B", "∅")
-    )
-
-
-def context_around(text: str, i: int) -> str:
-    """i번째 문자 앞뒤 문맥을 반환. 해당 문자는 【 】로 강조."""
-    start = max(0, i - CONTEXT_WINDOW)
-    end = min(len(text), i + CONTEXT_WINDOW + 1)
-    before = _visible(text[start:i])
-    ch = text[i]
-    after = _visible(text[i + 1:end])
-    lead = "…" if start > 0 else ""
-    tail = "…" if end < len(text) else ""
-    shown = ch if ch.strip() else f"U+{ord(ch):04X}"
-    return f"{lead}{before}【{shown}】{after}{tail}"
-
-
-def strip_accents(ch: str) -> str:
-    """NFKD 정규화로 발음기호 제거 (à→a, é→e 등)."""
-    decomposed = unicodedata.normalize("NFKD", ch)
-    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
-    return stripped if stripped else ch
-
-
-def clean_text(text: str):
-    """
-    (정제본, 변경내역, 미매핑목록) 반환.
-    독일어 확장 항상 적용. 치환 못 한 문자는 원본 유지 + 미매핑 기록.
-    """
-    changes = []
-    unmapped = []
-    out = []
-
-    for idx, ch in enumerate(text):
-        try:
-            ch.encode(TARGET_ENCODING)
-            out.append(ch)
-            continue
-        except UnicodeEncodeError:
-            pass
-
-        cp = ord(ch)
-
-        if ch in GERMAN_EXPANSION:
-            rep = GERMAN_EXPANSION[ch]
-            out.append(rep)
-            changes.append((ch, cp, rep, "독일어확장"))
-            continue
-
-        if ch in EXPLICIT_MAP:
-            rep = EXPLICIT_MAP[ch]
-            out.append(rep)
-            changes.append((ch, cp, rep if rep else "(제거)", "치환맵"))
-            continue
-
-        stripped = strip_accents(ch)
-        if stripped != ch:
-            try:
-                stripped.encode(TARGET_ENCODING)
-                out.append(stripped)
-                changes.append((ch, cp, stripped, "악센트제거"))
-                continue
-            except UnicodeEncodeError:
-                pass
-
-        # 치환 못 함 → 원본 유지 + 미매핑 기록 (삭제·물음표 안 함)
-        out.append(ch)
-        unmapped.append((idx, ch, cp))
-
-    return "".join(out), changes, unmapped
-
-
-def suggest_map_snippet(unmapped):
-    """미매핑 문자들을 EXPLICIT_MAP에 붙여넣을 코드 조각으로 생성."""
-    seen = {}
-    for _, ch, cp in unmapped:
-        seen[ch] = cp
-    lines = []
-    for ch, cp in seen.items():
-        name = unicodedata.name(ch, "이름없음")
-        lines.append(f'    "\\u{cp:04X}": "",   # {ch} ({name}) ← 치환문자 입력')
-    return "\n".join(lines)
-
-
-# ────────────────────────────────────────────────────────────
-# UI
-# ────────────────────────────────────────────────────────────
-st.set_page_config(page_title="CP949 인코딩 정제기", page_icon="🧹", layout="wide")
-
-st.title("🧹 CP949 인코딩 정제기")
-st.caption(
-    "웹에서 복사한 텍스트가 CP949(EUC-KR) 저장 시 전각 물음표(？)로 깨지는 걸 "
-    "미리 잡아 안전한 문자로 바꿔줍니다."
+from cp949_core import (
+    clean_text,
+    context_around,
+    find_breaking_chars,
+    suggest_map_snippet,
 )
 
+# ────────────────────────────────────────────────────────────
+# 주제분류 설정 (연구자료주제분류.xlsx의 29개 고유 주제)
+# ────────────────────────────────────────────────────────────
+TOPIC_LIST = [
+    "경제일반", "법·제도경제", "통계", "경제동향·전망", "금융·통화",
+    "국제금융(외환)", "재정·조세", "과학·기술", "정보통신", "무역·통상",
+    "농림·수산", "산업", "기업", "건설", "교통", "노동", "보건",
+    "복지(빈곤)", "교육", "환경", "자원", "국내지역", "세계경제일반",
+    "미국·미주", "유럽", "아시아", "국제기구", "국제관계", "북한",
+]
+
+TFOK = {
+    "T": "무역·통상, 공급망, 통상정책 중심",
+    "F": "금융·통화, 은행, 자본시장, 보험 중심",
+    "O": "경제동향·전망, 경기흐름, 거시전망 중심",
+    "K": "한국 관련 보고서·정책·사례 중심",
+}
+
+MODELS = {
+    "GPT-5.6 Sol (플래그십, 기본)": "gpt-5.6-sol",
+    "GPT-5.6 Terra (균형)": "gpt-5.6-terra",
+    "GPT-5.6 Luna (저비용·대량)": "gpt-5.6-luna",
+}
+
+
+def build_system_prompt() -> str:
+    topics = "\n".join(f"- {t}" for t in TOPIC_LIST)
+    tfok = "\n".join(f"- {k}: {v}" for k, v in TFOK.items())
+    return (
+        "당신은 KDI 경제정책 연구자료의 초록을 다듬고 주제분류하는 전문가입니다.\n"
+        "아래 4단계를 순서대로 수행하고, 마지막에 지정된 JSON으로만 출력하세요.\n\n"
+        "[1단계 — 요약 문장]\n"
+        '"A는 B를 분석한(모색한/살펴본/위한) 보고서를 발표하였다." 형식의 한 문장을 완성합니다.\n'
+        "- A는 고정값으로 굳이 생성하지 않아도 됩니다. 'A' 그대로 표시 가능.\n"
+        "- B의 성격에 따라 '분석한/모색한/살펴본/위한' 등 맥락에 맞는 서술어를 고릅니다.\n"
+        "- B는 초록의 핵심을 아주 짧게 담습니다.\n\n"
+        "[2단계 — 원문 다듬기]\n"
+        "초록에 오타가 있어도 절대 내용을 바꾸지 말고, 오직 (1) 어미를 음슴체(-음/-ㅁ)로 바꾸고, "
+        "(2) 띄어쓰기만 교정합니다.\n\n"
+        "[3단계 — 주제 분류]\n"
+        "초록을 바탕으로 주제를 최대 3개까지 지정합니다. 관련 주제가 없으면 '없음' 또는 1개만도 가능.\n"
+        "반드시 아래 주제 리스트 안에서만 고르세요. 리스트에 없는 주제를 만들지 마세요.\n"
+        f"[주제 리스트]\n{topics}\n\n"
+        "[TFOK 태그]\n"
+        "아래 기준에 해당하면 태그를 표기합니다. 여러 개 동시 해당 시 함께 표기(예: T, O, K). "
+        "해당 없으면 빈 배열.\n"
+        f"{tfok}\n\n"
+        "[4단계 — 번역]\n"
+        "초록이 영문이면 1·2단계 결과를 한글로 작성(번역)합니다. 이미 한글이면 그대로.\n\n"
+        "[출력 형식] — 아래 JSON만, 다른 텍스트·마크다운 없이:\n"
+        "{\n"
+        '  "summary": "1단계 결과 문장",\n'
+        '  "refined": "2단계 결과 (음슴체+띄어쓰기 교정, 필요 시 한글 번역)",\n'
+        '  "topics": ["주제1", "주제2", "주제3"],\n'
+        '  "tfok": ["T", "O"]\n'
+        "}"
+    )
+
+
+def process_abstract(abstract: str, model: str, api_key: str):
+    """초록을 4단계 처리. (결과dict, 원본응답) 반환."""
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": build_system_prompt()},
+            {"role": "user", "content": f"[초록]\n{abstract}"},
+        ],
+        response_format={"type": "json_object"},
+    )
+    raw = resp.choices[0].message.content.strip()
+    return json.loads(raw), raw
+
+
+def validate_topics(topics):
+    valid, invalid = [], []
+    for t in topics:
+        if t in TOPIC_LIST:
+            valid.append(t)
+        elif t in ("없음", "", None):
+            continue
+        else:
+            invalid.append(t)
+    return valid, invalid
+
+
+def get_openai_key():
+    try:
+        return st.secrets.get("OPENAI_API_KEY", "")
+    except Exception:
+        return ""
+
+
+# ────────────────────────────────────────────────────────────
+# 페이지 설정 + 세션 상태
+# ────────────────────────────────────────────────────────────
+st.set_page_config(page_title="연구자료 초록 처리 도구", page_icon="📑", layout="wide")
+
+# 정제 → 다듬기로 초록을 넘기기 위한 세션 저장소
+if "abstract_for_classify" not in st.session_state:
+    st.session_state.abstract_for_classify = ""
+
 with st.sidebar:
-    st.header("ℹ️ 처리 방식")
-    st.markdown(
-        "**정제 순서**\n\n"
-        "1. CP949 인코딩 시도 (되면 그대로 둠)\n"
-        "2. 안 되면 → **독일어 확장**(ü→ue) → **치환맵**(대시·공백·따옴표 등) "
-        "→ **악센트 제거**(é→e)\n"
-        "3. 그래도 안 되는 문자는 **원본 유지 + 경고** "
-        "(임의 삭제·물음표 치환 안 함)\n"
-        "4. 정제 후 재검증"
+    st.title("📑 초록 처리 도구")
+    page = st.radio(
+        "작업 선택",
+        ["1️⃣ 인코딩 정제", "2️⃣ 다듬기 & 주제분류"],
+        help="정제 → 다듬기 순서로 이어서 쓰면 편해요.",
     )
     st.divider()
-    st.markdown(
-        "- 독일어 움라우트 확장은 **항상 적용**돼요 (저자명 보존).\n"
-        "- 치환 못 한 문자는 지우지 않고 **그대로 두고 알려드려요.**\n"
-        "- 미매핑 문자가 나오면 **치환맵 추가 코드**를 만들어드려요."
+
+# ════════════════════════════════════════════════════════════
+# 페이지 1 — CP949 인코딩 정제
+# ════════════════════════════════════════════════════════════
+if page.startswith("1"):
+    st.title("1️⃣ CP949 인코딩 정제")
+    st.caption(
+        "웹에서 복사한 초록이 CP949 저장 시 전각 물음표(？)로 깨지는 걸 "
+        "미리 잡아 안전한 문자로 바꿉니다."
     )
 
-tab_text, tab_excel = st.tabs(["📝 텍스트 붙여넣기", "📊 엑셀 업로드"])
-
-
-def render_unmapped_alert(unmapped, full_text):
-    """미매핑 문자 경고 + 문맥 + 추가 코드 조각을 렌더."""
-    if not unmapped:
-        return
-    distinct = sorted({(ch, cp) for _, ch, cp in unmapped}, key=lambda x: x[1])
-    st.error(
-        f"🚨 치환하지 못한 문자 {len(distinct)}종 (총 {len(unmapped)}곳)이 "
-        "원본 그대로 남아 있어요. 이대로 저장하면 이 문자들은 깨집니다. "
-        "무엇으로 바꿀지 정한 뒤 아래 코드로 치환맵에 추가하세요."
-    )
-    rows = []
-    for ch, cp in distinct:
-        ctx = " / ".join(
-            context_around(full_text, i) for i, c, _ in unmapped if c == ch
+    with st.sidebar:
+        st.markdown("**정제 방식**")
+        st.markdown(
+            "- 깨지는 문자만 치환 (안 깨지는 건 그대로)\n"
+            "- 독일어 움라우트 확장(ü→ue) 항상 적용\n"
+            "- 치환 못 한 문자는 원본 유지 + 경고"
         )
-        rows.append(
-            {
-                "유니코드": f"U+{cp:04X}",
-                "문자": ch,
-                "이름": unicodedata.name(ch, "(이름없음)"),
-                "출현 위치(문맥)": ctx[:250],
-            }
+
+    tab_text, tab_excel = st.tabs(["📝 텍스트", "📊 엑셀 일괄"])
+
+    with tab_text:
+        src = st.text_area(
+            "정제할 초록",
+            height=200,
+            value=st.session_state.abstract_for_classify,
+            placeholder="여기에 초록을 붙여넣기…",
+            key="clean_input",
         )
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    st.markdown("**치환맵에 추가할 코드** (`app.py`의 `EXPLICIT_MAP`에 붙여넣기):")
-    st.code(suggest_map_snippet(unmapped), language="python")
 
+        if src:
+            broken = find_breaking_chars(src)
+            c1, c2 = st.columns(2)
+            c1.metric("전체 글자 수", len(src))
+            c2.metric("깨질 문자 수", len(broken))
 
-# ── 텍스트 모드 ──
-with tab_text:
-    src = st.text_area(
-        "정제할 텍스트를 붙여넣으세요",
-        height=220,
-        placeholder="여기에 초록/본문을 붙여넣기…",
-    )
+            if broken:
+                with st.expander(f"🔍 깨질 문자 {len(broken)}개 (앞뒤 문맥)", expanded=True):
+                    st.dataframe(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "유니코드": f"U+{cp:04X}",
+                                    "이름": unicodedata.name(ch, "(이름없음)"),
+                                    "문맥 (【】=문제 문자)": context_around(src, i),
+                                }
+                                for i, ch, cp in broken
+                            ]
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
-    if src:
-        broken = find_breaking_chars(src)
-        col1, col2 = st.columns(2)
-        col1.metric("전체 글자 수", len(src))
-        col2.metric("깨질 문자 수", len(broken))
+            cleaned, changes, unmapped = clean_text(src)
 
-        if broken:
-            with st.expander(
-                f"🔍 깨질 문자 {len(broken)}개 상세 (앞뒤 문맥)", expanded=True
-            ):
-                df_broken = pd.DataFrame(
-                    [
-                        {
-                            "유니코드": f"U+{cp:04X}",
-                            "이름": unicodedata.name(ch, "(이름없음)"),
-                            "앞뒤 문맥 (【】가 문제 문자)": context_around(src, i),
-                        }
-                        for i, ch, cp in broken
-                    ]
-                )
-                st.dataframe(df_broken, use_container_width=True, hide_index=True)
-                st.caption(
-                    "· 위치 번호 대신 앞뒤 문맥으로 표시했어요. 【】 안이 문제 문자이고, "
-                    "문맥 속 안 보이는 공백은 · 또는 ∅로 표시됩니다."
-                )
+            st.subheader("✅ 정제 결과")
+            st.text_area("정제된 초록", cleaned, height=200, key="clean_output")
 
-        cleaned, changes, unmapped = clean_text(src)
-
-        st.subheader("✅ 정제 결과")
-        st.text_area("정제된 텍스트 (복사해서 사용)", cleaned, height=220)
-
-        render_unmapped_alert(unmapped, src)
-
-        recheck = find_breaking_chars(cleaned)
-        if not recheck:
-            st.success("🎉 정제본은 CP949에 100% 안전합니다. 그대로 저장하면 안 깨져요.")
-        elif not unmapped:
-            st.warning(f"⚠️ 예상 못 한 잔여 깨짐 {len(recheck)}개. 확인이 필요해요.")
-
-        if changes:
-            with st.expander(f"🔧 변경 내역 {len(changes)}건"):
-                df_changes = pd.DataFrame(
-                    [
-                        {"원본": o, "유니코드": f"U+{cp:04X}", "→ 치환": r, "방식": how}
-                        for o, cp, r, how in changes
-                    ]
-                )
-                st.dataframe(df_changes, use_container_width=True, hide_index=True)
-
-# ── 엑셀 모드 ──
-with tab_excel:
-    st.markdown(
-        "엑셀 파일을 올리고 **정제할 컬럼**을 고르면, 정제본 컬럼을 추가해 "
-        "새 파일로 내려받을 수 있어요."
-    )
-    up = st.file_uploader("엑셀 파일 (.xlsx)", type=["xlsx"])
-
-    if up is not None:
-        df = pd.read_excel(up)
-        st.write("미리보기 (상위 5행)")
-        st.dataframe(df.head(), use_container_width=True)
-
-        col = st.selectbox("정제할 컬럼 선택", df.columns)
-
-        if st.button("정제 실행", type="primary"):
-            cleaned_col, remain_col, all_unmapped = [], [], []
-            for t in df[col].astype(str):
-                c, _, um = clean_text(t)
-                cleaned_col.append(c)
-                remain_col.append(len(find_breaking_chars(c)))
-                all_unmapped.extend(um)
-
-            df[f"{col}_정제"] = cleaned_col
-            df[f"{col}_남은깨짐"] = remain_col
-
-            total_remain = sum(remain_col)
-            if total_remain == 0:
-                st.success("정제 완료. 모든 행이 CP949에 안전합니다.")
-            else:
+            # 미매핑 경고
+            if unmapped:
+                distinct = sorted({(ch, cp) for _, ch, cp in unmapped}, key=lambda x: x[1])
                 st.error(
-                    f"🚨 정제 후에도 {total_remain}곳이 남았어요. "
-                    "아래 미매핑 문자를 치환맵에 추가한 뒤 다시 실행하세요."
-                )
-                distinct = sorted(
-                    {(ch, cp) for _, ch, cp in all_unmapped}, key=lambda x: x[1]
+                    f"🚨 치환 못 한 문자 {len(distinct)}종이 남아 있어요. "
+                    "무엇으로 바꿀지 정한 뒤 아래 코드로 cp949_core.py의 EXPLICIT_MAP에 추가하세요."
                 )
                 st.dataframe(
                     pd.DataFrame(
@@ -327,6 +206,10 @@ with tab_excel:
                                 "유니코드": f"U+{cp:04X}",
                                 "문자": ch,
                                 "이름": unicodedata.name(ch, "(이름없음)"),
+                                "문맥": " / ".join(
+                                    context_around(src, i)
+                                    for i, c, _ in unmapped if c == ch
+                                )[:200],
                             }
                             for ch, cp in distinct
                         ]
@@ -334,27 +217,152 @@ with tab_excel:
                     use_container_width=True,
                     hide_index=True,
                 )
-                st.code(suggest_map_snippet(all_unmapped), language="python")
+                st.code(suggest_map_snippet(unmapped), language="python")
 
-            st.dataframe(
-                df[[col, f"{col}_정제", f"{col}_남은깨짐"]].head(20),
-                use_container_width=True,
-            )
+            recheck = find_breaking_chars(cleaned)
+            if not recheck:
+                st.success("🎉 정제본은 CP949에 100% 안전합니다.")
 
-            out_buf = io.BytesIO()
-            with pd.ExcelWriter(out_buf, engine="openpyxl") as writer:
-                df.to_excel(writer, index=False)
-            out_buf.seek(0)
+            # ── 흐름 연결: 이 초록을 다듬기·분류로 넘기기 ──
+            if st.button("➡️ 이 정제본으로 다듬기 & 주제분류 하기", type="primary"):
+                st.session_state.abstract_for_classify = cleaned
+                st.success(
+                    "정제본을 넘겼어요. 사이드바에서 '2️⃣ 다듬기 & 주제분류'로 이동하세요."
+                )
 
-            st.download_button(
-                "📥 정제된 엑셀 내려받기",
-                data=out_buf,
-                file_name="cleaned.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            if changes:
+                with st.expander(f"🔧 변경 내역 {len(changes)}건"):
+                    st.dataframe(
+                        pd.DataFrame(
+                            [
+                                {"원본": o, "유니코드": f"U+{cp:04X}", "→ 치환": r, "방식": how}
+                                for o, cp, r, how in changes
+                            ]
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
-st.divider()
-st.caption(
-    "💡 근본 해결은 저장 대상(DB/폼)을 UTF-8(Oracle이면 AL32UTF8)로 바꾸는 것. "
-    "이 도구는 CP949 환경에서 어쩔 수 없을 때 쓰는 우회책입니다."
-)
+    with tab_excel:
+        st.markdown("엑셀 파일을 올리고 컬럼을 고르면 정제본 컬럼을 추가해 내려받아요.")
+        up = st.file_uploader("엑셀 (.xlsx)", type=["xlsx"])
+        if up is not None:
+            df = pd.read_excel(up)
+            st.dataframe(df.head(), use_container_width=True)
+            col = st.selectbox("정제할 컬럼", df.columns)
+            if st.button("정제 실행", type="primary"):
+                cleaned_col, remain_col = [], []
+                for t in df[col].astype(str):
+                    c, _, _ = clean_text(t)
+                    cleaned_col.append(c)
+                    remain_col.append(len(find_breaking_chars(c)))
+                df[f"{col}_정제"] = cleaned_col
+                df[f"{col}_남은깨짐"] = remain_col
+                total = sum(remain_col)
+                if total == 0:
+                    st.success("정제 완료. 모든 행이 CP949에 안전합니다.")
+                else:
+                    st.warning(f"정제 후에도 {total}곳이 남았어요 (희귀 문자).")
+                st.dataframe(
+                    df[[col, f"{col}_정제", f"{col}_남은깨짐"]].head(20),
+                    use_container_width=True,
+                )
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                    df.to_excel(w, index=False)
+                buf.seek(0)
+                st.download_button(
+                    "📥 정제된 엑셀 내려받기",
+                    data=buf,
+                    file_name="cleaned.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+# ════════════════════════════════════════════════════════════
+# 페이지 2 — 다듬기 & 주제분류 (GPT)
+# ════════════════════════════════════════════════════════════
+else:
+    st.title("2️⃣ 다듬기 & 주제분류")
+    st.caption(
+        "초록을 요약 문장 · 음슴체 교정 · 주제 3개 · TFOK 태그로 생성합니다 "
+        "(규칙 4단계, 주제는 29개 리스트 내에서만)."
+    )
+
+    with st.sidebar:
+        st.markdown("**🔑 API 설정**")
+        default_key = get_openai_key()
+        api_key = st.text_input(
+            "OpenAI API Key",
+            value="",
+            type="password",
+            help="배포 시 Secrets에 OPENAI_API_KEY를 넣으면 이 칸은 비워도 됩니다.",
+        )
+        if not api_key:
+            api_key = default_key  # 입력 없으면 Secrets 사용
+        model_label = st.selectbox("모델", list(MODELS.keys()))
+        model = MODELS[model_label]
+        with st.expander(f"주제 리스트 ({len(TOPIC_LIST)}개)"):
+            st.write(", ".join(TOPIC_LIST))
+        with st.expander("TFOK 태그"):
+            for k, v in TFOK.items():
+                st.markdown(f"- **{k}**: {v}")
+
+    # 정제 페이지에서 넘어온 초록이 있으면 자동 채움
+    abstract = st.text_area(
+        "초록 입력 (국문/영문)",
+        height=240,
+        value=st.session_state.abstract_for_classify,
+        placeholder="초록을 붙여넣거나, 1단계 정제에서 넘겨받은 초록이 여기 채워집니다.",
+    )
+
+    if st.button("🏷️ 주제분류 생성", type="primary", use_container_width=True):
+        if not api_key:
+            st.error("OpenAI API 키가 필요해요. 사이드바에 입력하거나 Secrets에 등록하세요.")
+        elif not abstract.strip():
+            st.error("초록을 입력해 주세요.")
+        else:
+            with st.spinner(f"{model_label}로 생성 중…"):
+                try:
+                    data, raw = process_abstract(abstract, model, api_key)
+                    summary = data.get("summary", "")
+                    refined = data.get("refined", "")
+                    valid_topics, invalid_topics = validate_topics(data.get("topics", []))
+                    tfok = data.get("tfok", [])
+
+                    st.subheader("✅ 최종 결과")
+                    st.markdown("**① 요약 문장**")
+                    st.write(summary)
+                    st.markdown("**② 다듬은 초록 (음슴체·띄어쓰기 교정)**")
+                    st.write(refined)
+                    st.markdown("**③ 주제분류**")
+                    st.write(" / ".join(valid_topics) if valid_topics else "없음")
+                    if tfok:
+                        st.markdown(f"**TFOK:** {', '.join(tfok)}")
+                    if invalid_topics:
+                        st.warning("리스트에 없어 제외: " + ", ".join(invalid_topics))
+
+                    st.divider()
+                    st.markdown("**📋 합본 (복사용)**")
+                    combined = f"{summary}\n\n{refined}\n\n"
+                    combined += f"주제: {' / '.join(valid_topics) if valid_topics else '없음'}"
+                    if tfok:
+                        combined += f"\nTFOK: {', '.join(tfok)}"
+                    st.text_area("합본", combined, height=200)
+
+                    with st.expander("🔧 원본 응답 (디버그)"):
+                        st.code(raw, language="json")
+                except ImportError:
+                    st.error(
+                        "openai 라이브러리가 없어요. requirements.txt에 'openai'를 추가하고 "
+                        "재배포하세요. (로컬은 pip install openai)"
+                    )
+                except json.JSONDecodeError:
+                    st.error("응답을 JSON으로 파싱하지 못했어요. 다시 시도하거나 모델을 바꿔보세요.")
+                except Exception as e:
+                    st.error(f"생성 중 오류: {e}")
+
+    st.divider()
+    st.caption(
+        "⚠️ 초록이 OpenAI API로 전송됩니다. 내부 미공개 자료면 정보보안 정책을 먼저 확인하세요. "
+        "· 공개 배포 시 API 키 과금 위험이 있으니 접근 제한을 권장합니다."
+    )
