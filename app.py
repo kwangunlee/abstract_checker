@@ -207,6 +207,24 @@ with st.sidebar:
         for k, v in TFOK.items():
             st.markdown(f"- **{k}**: {v}")
 
+    # ── 자주 쓰는 특수문자 팔레트 (모두 CP949 안전) ──
+    st.divider()
+    st.markdown("**⌨️ 특수문자 (CP949 안전)**")
+    st.caption("칸을 클릭하면 전체 선택 → Ctrl+C로 복사하세요.")
+    CHAR_GROUPS = {
+        "괄호·따옴표": "「」『』‘’“”",
+        "기호·구두점": "· ： … ※ ＞ >",
+        "도형": "▲ △ □ ■ ○ ● ◎ ◇ ◆ ★ ☆",
+        "번호(원숫자)": "①②③④⑤⑥⑦⑧⑨⑩⑪ Ⅰ",
+        "체크·전화": "√ ☎",
+        "화살표": "↔ → ↑ ← ↓",
+    }
+    for label, chars in CHAR_GROUPS.items():
+        st.text_input(label, value=chars, key=f"palette_{label}")
+    st.caption(
+        "※ 유니코드 체크(✓)는 CP949에서 깨져서 루트기호 √로 대체했어요."
+    )
+
 st.title(f"📑 초록 처리 — {source_type}")
 
 # ════════════════════════════════════════════════════════════
