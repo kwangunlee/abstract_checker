@@ -40,14 +40,18 @@ EXPLICIT_MAP = {
     "\u2022": "-",   # • bullet
     "\u2023": "-",   # ‣ triangular bullet
     # ── 가운뎃점(중점)류 → . ── (전각/반각/변종 모두)
-    "\u00B7": ".",   # · middle dot (라틴)
+    # "\u00B7": ".",   # · middle dot (라틴)
     "\u0387": ".",   # · greek ano teleia
     "\u2027": ".",   # ‧ hyphenation point
     "\u2219": ".",   # ∙ bullet operator
     "\u22C5": ".",   # ⋅ dot operator
     "\u2E31": ".",   # word separator middle dot
-    "\u30FB": ".",   # ・ 전각 가운뎃점 (CJK katakana middle dot)
-    "\uFF65": ".",   # ･ 반각 가운뎃점 (halfwidth katakana middle dot)
+    "\u30FB": "\u00B7",   # ・ 전각 → · 라틴 가운뎃점
+    "\uFF65": "\u00B7",   # ･ 반각 → ·
+    "\u2219": "\u00B7",   # ∙ → ·
+    "\u22C5": "\u00B7",   # ⋅ → ·
+    # "\u30FB": ".",   # ・ 전각 가운뎃점 (CJK katakana middle dot)
+    # "\uFF65": ".",   # ･ 반각 가운뎃점 (halfwidth katakana middle dot)
     # ── 기타 자주 나오는 기호 ──
     "\u00D7": "x", "\u00F7": "/", "\u2044": "/",
     "\u2122": "(TM)", "\u00A9": "(C)", "\u00AE": "(R)",
